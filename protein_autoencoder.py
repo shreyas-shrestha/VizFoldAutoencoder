@@ -8,24 +8,24 @@ from sklearn.model_selection import KFold
 from Data_Ingestion import load_protein_data
 
 class SimpleAutoencoder(nn.Module):
-    def __init__(self):
+    def __init__(self, input_dim=49000):  # 700*700 = 49,000
         super().__init__()
         # Encoder: 49000 -> 1024 -> 128 -> 8
         self.encoder = nn.Sequential(
-            nn.Linear(49000, 1024),  # proj_dim
+            nn.Linear(input_dim, 1024),  # proj_dim
             nn.ReLU(),
-            nn.Linear(1024, 128),    # hidden_dim
+            nn.Linear(1024, 128),        # hidden_dim
             nn.ReLU(),
-            nn.Linear(128, 8)        # latent_dim
+            nn.Linear(128, 8)            # latent_dim
         )
         
         # Decoder: 8 -> 128 -> 1024 -> 49000
         self.decoder = nn.Sequential(
-            nn.Linear(8, 128),       # latent -> hidden
+            nn.Linear(8, 128),           # latent -> hidden
             nn.ReLU(),
-            nn.Linear(128, 1024),    # hidden -> proj
+            nn.Linear(128, 1024),        # hidden -> proj
             nn.ReLU(),
-            nn.Linear(1024, 49000)   # proj -> output
+            nn.Linear(1024, input_dim)   # proj -> output
         )
     
     def forward(self, x):
@@ -104,7 +104,7 @@ def k_fold_cross_validation(data, k=5):
                 val_loader = DataLoader(val_dataset, batch_size=64, shuffle=False)
                 
                 # Create fresh model for this fold
-                model = SimpleAutoencoder()
+                model = SimpleAutoencoder(input_dim=train_data.shape[1])
                 
                 # Train and get validation score
                 val_score = train_model(model, train_loader, val_loader, lr, wd)
@@ -148,7 +148,7 @@ def train_final_model(data, best_params):
     val_loader = DataLoader(val_dataset, batch_size=64, shuffle=False)
     
     # Train final model
-    model = SimpleAutoencoder()
+    model = SimpleAutoencoder(input_dim=train_data.shape[1])
     optimizer = optim.SGD(model.parameters(), lr=best_params['lr'], weight_decay=best_params['wd'])
     criterion = nn.MSELoss()
     
@@ -189,8 +189,11 @@ def train_final_model(data, best_params):
     
     return model, train_losses, val_losses
 
-def visualize_results(model, data, train_losses, val_losses, protein_names):
+def visualize_results(model, data, train_losses, val_losses, protein_names, original_L):
     """Visualize training curves and reconstructions"""
+    
+    # For visualization, we'll show the original L×L part (before padding)
+    L_vis = min(original_L, 700)  # Use original L for visualization
     
     # Plot training curves
     plt.figure(figsize=(12, 4))
@@ -211,8 +214,13 @@ def visualize_results(model, data, train_losses, val_losses, protein_names):
         sample = torch.FloatTensor(data[:1])
         reconstructed = model(sample)
         
-        original = data[0][:700*700].reshape(700, 700)
-        recon = reconstructed[0][:700*700].reshape(700, 700).numpy()
+        # Reshape to 700x700 first, then take the meaningful part
+        original_700 = data[0].reshape(700, 700)
+        recon_700 = reconstructed[0].reshape(700, 700).numpy()
+        
+        # Extract the original L×L part for visualization
+        original = original_700[:L_vis, :L_vis]
+        recon = recon_700[:L_vis, :L_vis]
         
         plt.imshow(np.abs(original - recon), cmap='Reds')
         plt.title('Reconstruction Error')
@@ -221,23 +229,34 @@ def visualize_results(model, data, train_losses, val_losses, protein_names):
     plt.tight_layout()
     plt.show()
     
-    # Show original vs reconstructed examples
+    # Show original vs reconstructed examples for first few samples
     model.eval()
     with torch.no_grad():
         for i in range(min(3, len(data))):
             sample = torch.FloatTensor(data[i:i+1])
             reconstructed = model(sample)
             
-            original = data[i][:700*700].reshape(700, 700)
-            recon = reconstructed[0][:700*700].reshape(700, 700).numpy()
+            # Reshape to 700x700 first, then take the meaningful part
+            original_700 = data[i].reshape(700, 700)
+            recon_700 = reconstructed[0].reshape(700, 700).numpy()
             
-            fig, axes = plt.subplots(1, 2, figsize=(10, 4))
+            # Extract the original L×L part for visualization
+            original = original_700[:L_vis, :L_vis]
+            recon = recon_700[:L_vis, :L_vis]
             
-            axes[0].imshow(original, cmap='viridis')
+            fig, axes = plt.subplots(1, 3, figsize=(15, 4))
+            
+            im1 = axes[0].imshow(original, cmap='viridis')
             axes[0].set_title(f'Original - {protein_names[i] if i < len(protein_names) else f"Sample {i}"}')
+            plt.colorbar(im1, ax=axes[0])
             
-            axes[1].imshow(recon, cmap='viridis')
+            im2 = axes[1].imshow(recon, cmap='viridis')
             axes[1].set_title('Reconstructed')
+            plt.colorbar(im2, ax=axes[1])
+            
+            im3 = axes[2].imshow(np.abs(original - recon), cmap='Reds')
+            axes[2].set_title('Absolute Error')
+            plt.colorbar(im3, ax=axes[2])
             
             plt.tight_layout()
             plt.show()
@@ -245,7 +264,7 @@ def visualize_results(model, data, train_losses, val_losses, protein_names):
 def main():
     # Load data
     print("Loading protein data...")
-    data_matrix, protein_names = load_protein_data("Proteins_layer47", normalize=True)
+    data_matrix, protein_names, original_L = load_protein_data("Proteins_layer47", normalize=True)
     print(f"Data shape: {data_matrix.shape}")
     
     # K-fold cross validation with hyperparameter search
@@ -267,7 +286,7 @@ def main():
     
     # Visualize results
     print("\nGenerating visualizations...")
-    visualize_results(final_model, data_matrix, train_losses, val_losses, protein_names)
+    visualize_results(final_model, data_matrix, train_losses, val_losses, protein_names, original_L)
     
     # Save model
     torch.save(final_model.state_dict(), 'best_autoencoder.pth')
