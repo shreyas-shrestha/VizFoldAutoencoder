@@ -12,7 +12,7 @@ def load_protein_data(data_directory="Proteins_layer47", normalize=True):
     
     Returns:
         tuple: (data_matrix, protein_names, original_L)
-            - data_matrix: numpy array of shape (n_proteins * 128, 49000) 
+            - data_matrix: numpy array of shape (n_proteins * 128, 490000) 
             - protein_names: list of protein names (repeated 128 times)
             - original_L: int, original L dimension before padding to 700x700
     """
@@ -47,19 +47,13 @@ def load_protein_data(data_directory="Proteins_layer47", normalize=True):
                 # Get L×L matrix for this channel
                 channel_matrix = data[:, :, channel]  # Shape: (L, L)
                 
-                # Pad or truncate to 700×700 to get exactly 49,000 elements
-                if L < 700:
-                    # Zero-pad to 700×700
-                    padded_matrix = np.zeros((700, 700), dtype=channel_matrix.dtype)
-                    padded_matrix[:L, :L] = channel_matrix
-                    vector = padded_matrix.flatten()  # 700*700 = 49,000
-                elif L > 700:
-                    # Truncate to 700×700
-                    truncated_matrix = channel_matrix[:700, :700]
-                    vector = truncated_matrix.flatten()  # 700*700 = 49,000
-                else:
-                    # L == 700, perfect fit
-                    vector = channel_matrix.flatten()  # 700*700 = 49,000
+                # Pad to exactly 700x700 = 490,000 elements
+                # First, pad the L×L matrix to 700×700
+                padded_matrix = np.zeros((700, 700), dtype=channel_matrix.dtype)
+                padded_matrix[:L, :L] = channel_matrix
+                
+                # Flatten to get all 490,000 elements
+                vector = padded_matrix.flatten()
                 
                 all_vectors.append(vector)
                 all_protein_names.append(f"{file_path.stem}_ch{channel:03d}")
@@ -80,8 +74,8 @@ def load_protein_data(data_directory="Proteins_layer47", normalize=True):
         data_matrix = scaler.fit_transform(data_matrix)
     
     print(f"Loaded data shape: {data_matrix.shape}")
-    print(f"Total vectors: {len(all_vectors)} (10 proteins × 128 channels)")
-    print(f"Vector size: {data_matrix.shape[1]} (padded to 700×700 = 49,000)")
+    print(f"Total vectors: {len(all_vectors)}")
+    print(f"Vector size: {data_matrix.shape[1]} (700×700 padded matrices)")
     print(f"Original L dimension: {original_L}")
     
     return data_matrix, all_protein_names, original_L

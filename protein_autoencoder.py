@@ -5,39 +5,60 @@ from torch.utils.data import DataLoader, TensorDataset
 import numpy as np
 import matplotlib.pyplot as plt
 from sklearn.model_selection import KFold
+from torch.optim.lr_scheduler import ReduceLROnPlateau, CosineAnnealingLR
 from Data_Ingestion import load_protein_data
 
-class SimpleAutoencoder(nn.Module):
-    def __init__(self, input_dim=49000):  # 700*700 = 49,000
+class ProteinAutoencoder(nn.Module):
+    def __init__(self, input_dim=490000, proj_dim=1024, hidden_dim=128, latent_dim=8):
+        """
+        Autoencoder matching exact requirements:
+        - Input: 490,000 (700×700)
+        - Architecture: input → proj_dim → hidden_dim → latent_dim → hidden_dim → proj_dim → input
+        """
         super().__init__()
-        # Encoder: 49000 -> 1024 -> 128 -> 8
+        
+        # Encoder: 490000 → 1024 → 128 → 8
         self.encoder = nn.Sequential(
-            nn.Linear(input_dim, 1024),  # proj_dim
+            nn.Linear(input_dim, proj_dim),
             nn.ReLU(),
-            nn.Linear(1024, 128),        # hidden_dim
+            nn.Linear(proj_dim, hidden_dim),
             nn.ReLU(),
-            nn.Linear(128, 8)            # latent_dim
+            nn.Linear(hidden_dim, latent_dim)
         )
         
-        # Decoder: 8 -> 128 -> 1024 -> 49000
+        # Decoder: 8 → 128 → 1024 → 490000
         self.decoder = nn.Sequential(
-            nn.Linear(8, 128),           # latent -> hidden
+            nn.Linear(latent_dim, hidden_dim),
             nn.ReLU(),
-            nn.Linear(128, 1024),        # hidden -> proj
+            nn.Linear(hidden_dim, proj_dim),
             nn.ReLU(),
-            nn.Linear(1024, input_dim)   # proj -> output
+            nn.Linear(proj_dim, input_dim)
         )
+        
+        # Better weight initialization
+        self.apply(self._init_weights)
+    
+    def _init_weights(self, module):
+        if isinstance(module, nn.Linear):
+            # He initialization for ReLU networks
+            nn.init.kaiming_uniform_(module.weight, nonlinearity='relu')
+            if module.bias is not None:
+                nn.init.zeros_(module.bias)
     
     def forward(self, x):
         encoded = self.encoder(x)
         decoded = self.decoder(encoded)
         return decoded
 
-def train_model(model, train_loader, val_loader, lr, weight_decay, epochs=50):
-    """Train model with given hyperparameters"""
+def train_model(model, train_loader, val_loader, lr, weight_decay, epochs=50, device='cpu'):
+    """Train model with SGD and MSE loss as required"""
+    # Use SGD as specified (without momentum to match exact requirements)
     optimizer = optim.SGD(model.parameters(), lr=lr, weight_decay=weight_decay)
+    
+    # Use MSE loss as required
     criterion = nn.MSELoss()
     
+    model.to(device)
     train_losses = []
     val_losses = []
     
@@ -45,31 +66,47 @@ def train_model(model, train_loader, val_loader, lr, weight_decay, epochs=50):
         # Training
         model.train()
         train_loss = 0
+        num_batches = 0
+        
         for batch in train_loader:
-            data = batch[0]
+            data = batch[0].to(device)
             
             optimizer.zero_grad()
             output = model(data)
             loss = criterion(output, data)
+            
+            # Remove gradient clipping to match exact requirements
+            
             loss.backward()
             optimizer.step()
             
             train_loss += loss.item()
+            num_batches += 1
         
         # Validation
         model.eval()
         val_loss = 0
+        num_val_batches = 0
+        
         with torch.no_grad():
             for batch in val_loader:
-                data = batch[0]
+                data = batch[0].to(device)
                 output = model(data)
                 loss = criterion(output, data)
                 val_loss += loss.item()
+                num_val_batches += 1
         
-        train_losses.append(train_loss / len(train_loader))
-        val_losses.append(val_loss / len(val_loader))
+        avg_train_loss = train_loss / num_batches
+        avg_val_loss = val_loss / num_val_batches
+        
+        train_losses.append(avg_train_loss)
+        val_losses.append(avg_val_loss)
+        
+        # Print progress every 10 epochs
+        if (epoch + 1) % 10 == 0:
+            print(f"Epoch {epoch+1:2d}/{epochs} | Train {avg_train_loss:.6f} | Val {avg_val_loss:.6f}")
     
-    return val_losses[-1]  # Return final validation loss
+    return val_losses[-1] if val_losses else float('inf')
 
 def k_fold_cross_validation(data, k=5):
     """Perform K-fold cross validation with hyperparameter grid search"""
@@ -104,10 +141,11 @@ def k_fold_cross_validation(data, k=5):
                 val_loader = DataLoader(val_dataset, batch_size=64, shuffle=False)
                 
                 # Create fresh model for this fold
-                model = SimpleAutoencoder(input_dim=train_data.shape[1])
+                model = ProteinAutoencoder(input_dim=train_data.shape[1])
                 
                 # Train and get validation score
-                val_score = train_model(model, train_loader, val_loader, lr, wd)
+                device = 'cuda' if torch.cuda.is_available() else 'cpu'
+                val_score = train_model(model, train_loader, val_loader, lr, wd, device=device)
                 fold_scores.append(val_score)
                 
                 print(f"  Fold {fold+1}: {val_score:.6f}")
@@ -148,46 +186,67 @@ def train_final_model(data, best_params):
     val_loader = DataLoader(val_dataset, batch_size=64, shuffle=False)
     
     # Train final model
-    model = SimpleAutoencoder(input_dim=train_data.shape[1])
-    optimizer = optim.SGD(model.parameters(), lr=best_params['lr'], weight_decay=best_params['wd'])
+    model = ProteinAutoencoder(input_dim=train_data.shape[1])
+    
+    print("Training final model...")
+    device = 'cuda' if torch.cuda.is_available() else 'cpu'
+    
+    # Use the improved training function
+    final_val_loss = train_model(model, train_loader, val_loader, 
+                                best_params['lr'], best_params['wd'], 
+                                epochs=50, device=device)
+    
+    # Get training history by re-running a short training to get the curves
+    model_for_curves = ProteinAutoencoder(input_dim=train_data.shape[1])
+    optimizer = optim.SGD(model_for_curves.parameters(), lr=best_params['lr'], 
+                         weight_decay=best_params['wd'])
     criterion = nn.MSELoss()
+    model_for_curves.to(device)
     
     train_losses = []
     val_losses = []
     
-    print("Training final model...")
     for epoch in range(50):
         # Training
-        model.train()
+        model_for_curves.train()
         train_loss = 0
+        num_batches = 0
+        
         for batch in train_loader:
-            data_batch = batch[0]
+            data_batch = batch[0].to(device)
             
             optimizer.zero_grad()
-            output = model(data_batch)
+            output = model_for_curves(data_batch)
             loss = criterion(output, data_batch)
+            
+            # Remove gradient clipping to match exact requirements
+            
             loss.backward()
             optimizer.step()
             
             train_loss += loss.item()
+            num_batches += 1
         
         # Validation
-        model.eval()
+        model_for_curves.eval()
         val_loss = 0
+        num_val_batches = 0
+        
         with torch.no_grad():
             for batch in val_loader:
-                data_batch = batch[0]
-                output = model(data_batch)
+                data_batch = batch[0].to(device)
+                output = model_for_curves(data_batch)
                 loss = criterion(output, data_batch)
                 val_loss += loss.item()
+                num_val_batches += 1
         
-        train_losses.append(train_loss / len(train_loader))
-        val_losses.append(val_loss / len(val_loader))
+        train_losses.append(train_loss / num_batches)
+        val_losses.append(val_loss / num_val_batches)
         
         if (epoch + 1) % 10 == 0:
-            print(f'Epoch {epoch+1}/50, Train Loss: {train_losses[-1]:.6f}, Val Loss: {val_losses[-1]:.6f}')
+            print(f'Epoch {epoch+1}/50 | Train {train_losses[-1]:.6f} | Val {val_losses[-1]:.6f}')
     
-    return model, train_losses, val_losses
+    return model_for_curves, train_losses, val_losses
 
 def visualize_results(model, data, train_losses, val_losses, protein_names, original_L):
     """Visualize training curves and reconstructions"""
