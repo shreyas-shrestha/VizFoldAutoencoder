@@ -1,0 +1,250 @@
+"""
+Trained fully connected autoencoder with interpolated data and size info
+"""
+
+import numpy as np
+import torch
+import torch.nn as nn
+import torch.optim as optim
+from torch.utils.data import DataLoader, random_split
+import matplotlib.pyplot as plt
+import os
+import argparse
+import time
+import json
+from interpolated_dataset_with_position import (
+    InterpolatedProteinDatasetWithPosition, 
+    FCAutoEncoderWithPosition
+)
+
+
+def train_epoch(model, dataloader, criterion, optimizer, device, base_input_dim):
+    """Train for one epoch."""
+    model.train()
+    total_loss = 0.0
+    
+    for batch_data, _ in dataloader:
+        batch_data = batch_data.to(device)
+        
+        optimizer.zero_grad()
+        reconstructed, latent = model(batch_data)
+        # Only compare with base input (not extra dimensions)
+        target = batch_data[:, :base_input_dim]
+        loss = criterion(reconstructed, target)
+        loss.backward()
+        optimizer.step()
+        
+        total_loss += loss.item()
+    
+    return total_loss / len(dataloader)
+
+
+def validate(model, dataloader, criterion, device, base_input_dim):
+    """Validate model."""
+    model.eval()
+    total_loss = 0.0
+    
+    with torch.no_grad():
+        for batch_data, _ in dataloader:
+            batch_data = batch_data.to(device)
+            reconstructed, latent = model(batch_data)
+            target = batch_data[:, :base_input_dim]
+            loss = criterion(reconstructed, target)
+            total_loss += loss.item()
+    
+    return total_loss / len(dataloader)
+
+
+def plot_losses(train_losses, val_losses, save_path: str):
+    """Plot training and validation losses."""
+    plt.figure(figsize=(12, 6))
+    plt.plot(train_losses, label='Train Loss', marker='o', markersize=3)
+    plt.plot(val_losses, label='Val Loss', marker='s', markersize=3)
+    plt.xlabel('Epoch', fontsize=12)
+    plt.ylabel('Loss (MSE)', fontsize=12)
+    plt.title('Training and Validation Loss', fontsize=14, fontweight='bold')
+    plt.legend(fontsize=11)
+    plt.grid(True, alpha=0.3)
+    plt.yscale('log')
+    plt.savefig(save_path, dpi=150, bbox_inches='tight')
+    plt.close()
+    print(f"Loss plot saved to {save_path}")
+
+
+def main():
+    parser = argparse.ArgumentParser(description='Train with interpolation and positional info')
+    parser.add_argument('--experiment', type=str, choices=['no_pos', 'size_only', 'positional'],
+                       default='size_only', help='Which experiment to run')
+    parser.add_argument('--protein_dir', type=str, default='.', help='Protein directory')
+    parser.add_argument('--layer', type=int, default=47, help='Layer number')
+    parser.add_argument('--channel', type=int, default=0, help='Channel index')
+    parser.add_argument('--epochs', type=int, default=100, help='Number of epochs')
+    parser.add_argument('--lr', type=float, default=0.001, help='Learning rate')
+    parser.add_argument('--target_size', type=int, default=342, help='Target size for interpolation')
+    parser.add_argument('--interpolation', type=str, default='bilinear', 
+                       choices=['bilinear', 'nearest', 'bicubic', 'lanczos'],
+                       help='Interpolation method')
+    parser.add_argument('--projection_dim', type=int, default=1000, help='Projection dimension')
+    parser.add_argument('--latent_dim', type=int, default=64, help='Latent dimension')
+    parser.add_argument('--device', type=str, default='cuda' if torch.cuda.is_available() else 'cpu', help='Device')
+    
+    args = parser.parse_args()
+    
+    device = torch.device(args.device)
+    print(f"Using device: {device}")
+    
+    # Find proteins
+    proteins = [d for d in os.listdir(args.protein_dir) 
+               if os.path.isdir(os.path.join(args.protein_dir, d)) and not d.startswith('.')]
+    proteins = [p for p in proteins if p not in ['7tkv_A', '7pbk_A', '7kdx_B', 'channel_analysis']]
+    proteins.sort()
+    
+    # Filter to only proteins that have the data file
+    data_paths = []
+    valid_proteins = []
+    for p in proteins:
+        path = os.path.join(args.protein_dir, p, f'{p}_pair_block_{args.layer}.npy')
+        if os.path.exists(path):
+            data_paths.append(path)
+            valid_proteins.append(p)
+    
+    proteins = valid_proteins
+    
+    print(f"Found {len(proteins)} proteins")
+    print(f"Experiment: {args.experiment}")
+    
+    # Create dataset based on experiment
+    if args.experiment == 'no_pos':
+        add_size_info = False
+        add_positional = False
+    elif args.experiment == 'size_only':
+        add_size_info = True
+        add_positional = False
+    elif args.experiment == 'positional':
+        add_size_info = True
+        add_positional = True
+    
+    dataset = InterpolatedProteinDatasetWithPosition(
+        data_paths, 
+        channel_indices=[args.channel],
+        target_size=args.target_size,
+        interpolation=args.interpolation,
+        add_size_info=add_size_info,
+        add_positional_encoding=add_positional
+    )
+    
+    # Get dimensions
+    sample, _ = dataset[0]
+    total_input_dim = sample.shape[0]
+    base_input_dim = args.target_size * args.target_size * 1  # spatial * channels
+    extra_dims = dataset.extra_dims
+    
+    print(f"Base input dim: {base_input_dim}")
+    print(f"Extra dims: {extra_dims}")
+    print(f"Total input dim: {total_input_dim}")
+    
+    # Split dataset
+    train_size = int(0.8 * len(dataset))
+    val_size = len(dataset) - train_size
+    train_dataset, val_dataset = random_split(dataset, [train_size, val_size],
+                                             generator=torch.Generator().manual_seed(42))
+    
+    print(f"Train size: {len(train_dataset)}, Val size: {len(val_dataset)}")
+    
+    # Create data loaders
+    train_loader = DataLoader(train_dataset, batch_size=1, shuffle=True)
+    val_loader = DataLoader(val_dataset, batch_size=1, shuffle=False)
+    
+    # Create model
+    model = FCAutoEncoderWithPosition(
+        base_input_dim=base_input_dim,
+        extra_dims=extra_dims,
+        projection_dim=args.projection_dim,
+        latent_dim=args.latent_dim
+    ).to(device)
+    
+    total_params = sum(p.numel() for p in model.parameters())
+    print(f"Model created with {total_params:,} parameters")
+    print(f"Architecture: {total_input_dim} → {args.projection_dim} → {args.latent_dim} → {args.projection_dim} → {base_input_dim}")
+    
+    # Loss and optimizer
+    criterion = nn.MSELoss()
+    optimizer = optim.Adam(model.parameters(), lr=args.lr)
+    
+    print(f"Optimizer: Adam, LR: {args.lr}")
+    print(f"Interpolation: {args.interpolation}, Target size: {args.target_size}×{args.target_size}")
+    
+    # Training loop
+    train_losses = []
+    val_losses = []
+    best_val_loss = float('inf')
+    
+    print("\nStarting training...")
+    print("=" * 80, flush=True)
+    start_time = time.time()
+    
+    for epoch in range(args.epochs):
+        train_loss = train_epoch(model, train_loader, criterion, optimizer, device, base_input_dim)
+        val_loss = validate(model, val_loader, criterion, device, base_input_dim)
+        
+        train_losses.append(train_loss)
+        val_losses.append(val_loss)
+        
+        if val_loss < best_val_loss:
+            best_val_loss = val_loss
+        
+        # Print progress
+        if (epoch + 1) % 10 == 0 or epoch == 0 or train_loss < 0.0001:
+            elapsed = time.time() - start_time
+            avg_time = elapsed / (epoch + 1)
+            remaining = avg_time * (args.epochs - epoch - 1)
+            print(f"Epoch {epoch+1}/{args.epochs} - Train Loss: {train_loss:.8f}, Val Loss: {val_loss:.8f} | "
+                  f"Elapsed: {elapsed:.1f}s | Est. remaining: {remaining:.1f}s", flush=True)
+    
+    total_time = time.time() - start_time
+    print(f"\nTraining complete!")
+    print(f"Best validation loss: {best_val_loss:.8f}")
+    print(f"Final train loss: {train_losses[-1]:.8f}")
+    print(f"Final val loss: {val_losses[-1]:.8f}")
+    print(f"Total training time: {total_time:.1f}s ({total_time/60:.1f} minutes)")
+    
+    # Plot losses
+    config_suffix = f"_interp{args.interpolation}_size{args.target_size}_{args.experiment}"
+    plot_path = f'losses_interpolated_ch{args.channel}{config_suffix}.png'
+    plot_losses(train_losses, val_losses, plot_path)
+    
+    # Save model
+    model_path = f'model_interpolated_ch{args.channel}{config_suffix}.pth'
+    torch.save(model.state_dict(), model_path)
+    print(f"Model saved to {model_path}")
+    
+    # Save info
+    info = {
+        'experiment': args.experiment,
+        'channel': args.channel,
+        'base_input_dim': base_input_dim,
+        'extra_dims': extra_dims,
+        'total_input_dim': total_input_dim,
+        'projection_dim': args.projection_dim,
+        'latent_dim': args.latent_dim,
+        'total_params': total_params,
+        'best_val_loss': best_val_loss,
+        'final_train_loss': train_losses[-1],
+        'final_val_loss': val_losses[-1],
+        'interpolation': args.interpolation,
+        'target_size': args.target_size,
+        'add_size_info': add_size_info,
+        'add_positional_encoding': add_positional,
+        'lr': args.lr,
+        'epochs': args.epochs
+    }
+    
+    info_path = f'interpolated_info_ch{args.channel}{config_suffix}.json'
+    with open(info_path, 'w') as f:
+        json.dump(info, f, indent=2)
+    print(f"Info saved to {info_path}")
+
+
+if __name__ == '__main__':
+    main()
+
